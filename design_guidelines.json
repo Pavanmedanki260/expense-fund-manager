@@ -1,0 +1,113 @@
+{
+  "project_name": "FundTrack",
+  "theme_and_archetype": {
+    "domain": "Finance, Organization Fund Tracker",
+    "theme": "Light & Dark (Toggle required in top-right header)",
+    "archetype": "Archetype 4: Swiss & High-Contrast (Adapted for user's explicit flat/teal constraints)",
+    "vibe": "Objective, rigid, functional, highly readable"
+  },
+  "colors": {
+    "light": {
+      "background": "#F4F4F5",
+      "surface": "#FFFFFF",
+      "primary": "#1D9E75",
+      "primary_hover": "#147A5A",
+      "text_primary": "#0F6E56",
+      "text_secondary": "#2D8A74",
+      "border": "#E4E4E7"
+    },
+    "dark": {
+      "background": "#1A1A1A",
+      "surface": "#262626",
+      "primary": "#5DCAA5",
+      "primary_hover": "#47B28D",
+      "text_primary": "#F5F5F5",
+      "text_secondary": "#A3A3A3",
+      "border": "#404040"
+    },
+    "status": {
+      "healthy": {
+        "condition": "<= 80% utilized",
+        "light_bg": "#D1FAE5",
+        "light_text": "#065F46",
+        "dark_bg": "#064E3B",
+        "dark_text": "#34D399"
+      },
+      "warning": {
+        "condition": "> 80% utilized",
+        "light_bg": "#FEF3C7",
+        "light_text": "#92400E",
+        "dark_bg": "#78350F",
+        "dark_text": "#FBBF24"
+      },
+      "danger": {
+        "condition": "Over-utilized ( > 100% )",
+        "light_bg": "#FEE2E2",
+        "light_text": "#B91C1C",
+        "dark_bg": "#7F1D1D",
+        "dark_text": "#F87171"
+      }
+    },
+    "global_rules": {
+      "gradients": "FORBIDDEN. Use flat color fills only.",
+      "glassmorphism": "FORBIDDEN. Use solid colors.",
+      "shadows": "Minimal or none. Rely on 1px borders for structure."
+    }
+  },
+  "typography": {
+    "fonts": {
+      "heading": "'Outfit', sans-serif",
+      "body": "'DM Sans', sans-serif"
+    },
+    "rules": {
+      "headings_weight": "500 (Medium) - STRICT USER CONSTRAINT",
+      "body_weight": "400 (Regular)",
+      "letter_spacing": "tracking-tight for headings > 24px",
+      "no_inter": "Do NOT use Inter, Roboto, or Open Sans."
+    },
+    "hierarchy": {
+      "h1": "text-3xl sm:text-4xl font-medium tracking-tight",
+      "h2": "text-xl sm:text-2xl font-medium tracking-tight",
+      "h3": "text-lg sm:text-xl font-medium",
+      "body": "text-base",
+      "small": "text-sm text-secondary"
+    }
+  },
+  "spacing_and_layout": {
+    "border_radius": {
+      "components": "rounded-[8px]",
+      "cards": "rounded-[12px]"
+    },
+    "dashboard_grid": "The 'Control Room' Grid: grid-cols-1 md:grid-cols-3 lg:grid-cols-4 gap-6",
+    "kpi_cards": "col-span-1. F-pattern priority: Total Collected, Total Utilized, Balance, % Utilized.",
+    "charts_layout": "PieChart (Category): col-span-1 md:col-span-2. BarChart (Monthly): col-span-1 md:col-span-2 or 3. Ensure 100% height filling.",
+    "activity_feed": "List format. Compact vertical spacing. col-span-1 md:col-span-4 lg:col-span-1 if side-aligned.",
+    "spacing_scale": "Generous spacing: use p-6 or p-8 inside cards. py-8 for sections."
+  },
+  "components": {
+    "buttons": "Flat background, rounded-[8px], transition-colors duration-200. No drop shadows.",
+    "google_btn": "Flat white (light) or flat dark gray (dark), 1px border, rounded-[8px], left-aligned G logo.",
+    "cards": "bg-surface rounded-[12px] border border-border p-6. Flat design, zero shadow.",
+    "inputs": "Shadcn based. rounded-[8px], border border-border, bg-transparent. focus:ring-2 focus:ring-primary focus:outline-none.",
+    "badges": "rounded-full px-2.5 py-0.5 text-xs font-semibold. See colors.status.",
+    "tables": "Flat headers. 1px bottom border on rows. Left-aligned data. No vertical dividers.",
+    "charts": "Recharts. Monochromatic teal scales (#1D9E75, #147A5A, #5DCAA5) for primary data. Flat fills only, no gradients.",
+    "sidebar": "Left sidebar for navigation. Light/Dark toggle in top-right global header."
+  },
+  "formatting_and_logic": {
+    "currency": "INR formatting only. Use Intl.NumberFormat('en-IN', { style: 'currency', currency: 'INR', maximumFractionDigits: 0 }). Example: ₹1,00,000",
+    "roles": "Admin (Full CRUD + User Mgmt), Contributor (Fund/Utilization CRUD), Viewer (Read-only)"
+  },
+  "media": {
+    "login_background": {
+      "url": "https://images.pexels.com/photos/36077712/pexels-photo-36077712.jpeg?auto=compress&cs=tinysrgb&dpr=2&h=650&w=940",
+      "description": "Modern office building's symmetrical facade with vertical lines. Use on the right side of a split-screen login layout.",
+      "overlay": "bg-black/20 to maintain flat/clean look without obscuring the architecture."
+    }
+  },
+  "development_rules": {
+    "testing": "All interactive and key informational elements MUST include a data-testid attribute (e.g., data-testid='login-button', data-testid='kpi-balance').",
+    "icons": "Use lucide-react. Keep them minimal, 20px for sidebar, 16px for inline.",
+    "mobile_first": "Start with grid-cols-1 for all layouts. Use max-h-[80vh] for any large media on mobile. Hamburger menu on mobile only."
+  }
+}
