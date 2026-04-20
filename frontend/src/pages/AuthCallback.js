@@ -33,7 +33,8 @@ export default function AuthCallback() {
         if (!res.ok) throw new Error('Session exchange failed');
         const userData = await res.json();
         setUser(userData);
-        navigate('/dashboard', { replace: true, state: { user: userData } });
+        // Redirect to groups list (main landing after auth)
+        navigate('/groups', { replace: true, state: { user: userData } });
       } catch (err) {
         console.error('Auth callback error:', err);
         navigate('/login', { replace: true });

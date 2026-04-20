@@ -17,6 +17,7 @@ export const api = {
     if (!r.ok) throw new Error(r.statusText);
     return r.blob();
   }),
+  getPublic: (path) => fetch(`${API}${path}`).then(r => { if (!r.ok) throw new Error(r.statusText); return r.json(); }),
 };
 
 export function formatINR(amount) {
@@ -27,12 +28,4 @@ export function formatDate(dateStr) {
   if (!dateStr) return '';
   const d = new Date(dateStr);
   return d.toLocaleDateString('en-IN', { day: '2-digit', month: 'short', year: 'numeric' });
-}
-
-export function getStatusBadge(collected, utilized) {
-  if (collected === 0) return { class: 'badge-healthy', text: 'No Funds' };
-  const pct = (utilized / collected) * 100;
-  if (pct > 100) return { class: 'badge-danger', text: 'Over-utilized' };
-  if (pct > 80) return { class: 'badge-warning', text: 'High Usage' };
-  return { class: 'badge-healthy', text: 'Healthy' };
 }

@@ -1,41 +1,56 @@
-# FundTrack Test Credentials
+# FundTrack Test Credentials (Multi-Group Architecture)
 
-## Test Users (seeded in MongoDB)
+## Test Users
 
-### Admin User
+### Super Admin
 - Email: admin@fundtrack.test
 - User ID: user_testadmin001
 - Session Token: test_session_admin_001
-- Role: admin
+- is_super_admin: true (can see all groups)
 
 ### Contributor User
 - Email: contributor@fundtrack.test
 - User ID: user_testcontrib01
 - Session Token: test_session_contrib_001
-- Role: contributor
+- is_super_admin: false
 
 ### Viewer User
 - Email: viewer@fundtrack.test
 - User ID: user_testviewer001
 - Session Token: test_session_viewer_001
-- Role: viewer
+- is_super_admin: false
 
-## Authentication
-- Auth Type: Emergent-managed Google OAuth (Google Social Login)
-- No email/password auth
-- Session tokens are set via cookies
-- For testing, use Authorization header: `Bearer <session_token>`
+## Auth Type
+- Emergent-managed Google OAuth (Google Social Login)
+- Session tokens set via httpOnly cookies
+- For API testing, use Authorization header: `Bearer <session_token>`
 
-## Database
-- MongoDB: fundtrack
-- Collections: users, user_sessions, funds, utilizations
+## Test Groups
 
-## Sample Fund IDs (seeded)
-- fund_seed001: Corporate Donation - TCS (₹5,00,000)
-- fund_seed002: Government Grant - Education (₹12,00,000)
-- fund_seed003: Workshop Revenue (₹75,000)
-- fund_seed004: Individual Donation - Rahul (₹25,000)
-- fund_seed005: Misc Fund (₹30,000)
+### Group 1: Education Fund 2025
+- Group ID: grp_education01
+- Members: admin (admin role), contributor (contributor role), viewer (viewer role)
+- Has 3 funds, 2 utilizations seeded
 
-## Sample Utilization IDs (seeded)
-- util_seed001 to util_seed005
+### Group 2: CSR Fund Q1
+- Group ID: grp_csrfund0001
+- Members: admin (admin role), contributor (contributor role)
+- Viewer is NOT a member (should get 403)
+- Has 2 funds, 1 utilization seeded
+
+## Sample Fund IDs
+- fund_edu001, fund_edu002, fund_edu003 (Group 1)
+- fund_csr001, fund_csr002 (Group 2)
+
+## API Endpoints (all group-scoped)
+- Groups: /api/groups, /api/groups/{groupId}
+- Funds: /api/groups/{groupId}/funds
+- Utilizations: /api/groups/{groupId}/utilizations
+- Dashboard: /api/groups/{groupId}/dashboard
+- Members: /api/groups/{groupId}/members
+- Invite: /api/groups/{groupId}/invite
+- Export: /api/groups/{groupId}/export/excel
+
+## Resend API
+- Key: configured in backend .env
+- Sender: onboarding@resend.dev (testing mode)

@@ -1,6 +1,9 @@
 import os
 import uuid
+import asyncio
 import httpx
+import resend
+import logging
 from datetime import datetime, timezone, timedelta
 from io import BytesIO
 from typing import Optional
@@ -11,19 +14,30 @@ load_dotenv()
 from fastapi import FastAPI, HTTPException, Request, Response, Query, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 from motor.motor_asyncio import AsyncIOMotorClient
 from openpyxl import Workbook
-from openpyxl.styles import Font, PatternFill, Alignment, numbers
+from openpyxl.styles import Font, PatternFill, Alignment
+
+logger = logging.getLogger(__name__)
 
 app = FastAPI(title="FundTrack API")
 
 MONGO_URL = os.environ.get("MONGO_URL")
 DB_NAME = os.environ.get("DB_NAME")
+RESEND_API_KEY = os.environ.get("RESEND_API_KEY")
+SENDER_EMAIL = os.environ.get("SENDER_EMAIL", "onboarding@resend.dev")
+APP_URL = os.environ.get("APP_URL", "")
+
+resend.api_key = RESEND_API_KEY
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=[
+        APP_URL,
+        "http://localhost:3000",
+        "https://b844d7d4-15d5-4ca4-8fbd-5ff90237ce2f.preview.emergentagent.com",
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -34,6 +48,14 @@ db = client[DB_NAME]
 
 
 # ── Models ──────────────────────────────────────────────────────
+class GroupCreate(BaseModel):
+    name: str
+    description: Optional[str] = ""
+
+class InviteCreate(BaseModel):
+    email: str
+    role: str
+
 class FundCreate(BaseModel):
     source_name: str
     amount_inr: float
@@ -50,11 +72,8 @@ class UtilizationCreate(BaseModel):
     notes: Optional[str] = ""
     receipt_url: Optional[str] = ""
 
-class RoleUpdate(BaseModel):
+class MemberRoleUpdate(BaseModel):
     role: str
-
-class UserStatusUpdate(BaseModel):
-    is_active: bool
 
 
 # ── Auth Helpers ────────────────────────────────────────────────
@@ -85,13 +104,26 @@ async def get_current_user(request: Request):
         raise HTTPException(status_code=403, detail="Account deactivated")
     return user
 
-def require_role(*roles):
-    async def checker(request: Request):
-        user = await get_current_user(request)
-        if user["role"] not in roles:
-            raise HTTPException(status_code=403, detail="Insufficient permissions")
-        return user
-    return checker
+
+async def get_group_member_role(user_id: str, group_id: str):
+    """Get user's role in a specific group. Returns None if not a member."""
+    member = await db.group_members.find_one(
+        {"group_id": group_id, "user_id": user_id}, {"_id": 0}
+    )
+    return member["role"] if member else None
+
+
+async def require_group_role(request: Request, group_id: str, allowed_roles: list):
+    """Check user has required role in the group. Super admins bypass."""
+    user = await get_current_user(request)
+    if user.get("is_super_admin"):
+        return user, "super_admin"
+    role = await get_group_member_role(user["user_id"], group_id)
+    if not role:
+        raise HTTPException(status_code=403, detail="Not a member of this group")
+    if role not in allowed_roles:
+        raise HTTPException(status_code=403, detail="Insufficient permissions in this group")
+    return user, role
 
 
 # ── Auth Endpoints ──────────────────────────────────────────────
@@ -120,10 +152,9 @@ async def exchange_session(request: Request, response: Response):
             {"$set": {"name": name, "avatar_url": picture}}
         )
         user_id = existing_user["user_id"]
-        role = existing_user["role"]
     else:
         user_count = await db.users.count_documents({})
-        role = "admin" if user_count == 0 else "viewer"
+        is_super = user_count == 0
         user_id = f"user_{uuid.uuid4().hex[:12]}"
         await db.users.insert_one({
             "user_id": user_id,
@@ -131,10 +162,30 @@ async def exchange_session(request: Request, response: Response):
             "name": name,
             "email": email,
             "avatar_url": picture,
-            "role": role,
+            "is_super_admin": is_super,
             "is_active": True,
             "created_at": datetime.now(timezone.utc)
         })
+    # Auto-accept any pending invitations for this email
+    pending_invites = await db.invitations.find(
+        {"email": email, "status": "pending"}, {"_id": 0}
+    ).to_list(100)
+    for inv in pending_invites:
+        existing_member = await db.group_members.find_one(
+            {"group_id": inv["group_id"], "user_id": user_id}, {"_id": 0}
+        )
+        if not existing_member:
+            await db.group_members.insert_one({
+                "group_id": inv["group_id"],
+                "user_id": user_id,
+                "role": inv["role"],
+                "joined_at": datetime.now(timezone.utc).isoformat(),
+            })
+        await db.invitations.update_one(
+            {"invite_id": inv["invite_id"]},
+            {"$set": {"status": "accepted", "accepted_by_user_id": user_id}}
+        )
+
     await db.user_sessions.insert_one({
         "user_id": user_id,
         "session_token": session_token,
@@ -142,12 +193,8 @@ async def exchange_session(request: Request, response: Response):
         "created_at": datetime.now(timezone.utc)
     })
     response.set_cookie(
-        key="session_token",
-        value=session_token,
-        httponly=True,
-        secure=True,
-        samesite="none",
-        path="/",
+        key="session_token", value=session_token,
+        httponly=True, secure=True, samesite="none", path="/",
         max_age=7 * 24 * 60 * 60,
     )
     user = await db.users.find_one({"user_id": user_id}, {"_id": 0})
@@ -168,16 +215,273 @@ async def logout(request: Request, response: Response):
     return {"message": "Logged out"}
 
 
-# ── Fund Endpoints ──────────────────────────────────────────────
-@app.get("/api/funds")
+# ── Group Endpoints ─────────────────────────────────────────────
+@app.post("/api/groups")
+async def create_group(body: GroupCreate, user=Depends(get_current_user)):
+    group_id = f"grp_{uuid.uuid4().hex[:12]}"
+    await db.groups.insert_one({
+        "group_id": group_id,
+        "name": body.name,
+        "description": body.description,
+        "created_by_user_id": user["user_id"],
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    })
+    # Creator becomes group admin
+    await db.group_members.insert_one({
+        "group_id": group_id,
+        "user_id": user["user_id"],
+        "role": "admin",
+        "joined_at": datetime.now(timezone.utc).isoformat(),
+    })
+    group = await db.groups.find_one({"group_id": group_id}, {"_id": 0})
+    return group
+
+
+@app.get("/api/groups")
+async def list_groups(user=Depends(get_current_user)):
+    if user.get("is_super_admin"):
+        groups = await db.groups.find({}, {"_id": 0}).sort("created_at", -1).to_list(500)
+    else:
+        memberships = await db.group_members.find(
+            {"user_id": user["user_id"]}, {"_id": 0}
+        ).to_list(500)
+        group_ids = [m["group_id"] for m in memberships]
+        if not group_ids:
+            return []
+        groups = await db.groups.find(
+            {"group_id": {"$in": group_ids}}, {"_id": 0}
+        ).sort("created_at", -1).to_list(500)
+    # Enrich with member count and user's role
+    for g in groups:
+        count = await db.group_members.count_documents({"group_id": g["group_id"]})
+        g["member_count"] = count
+        if user.get("is_super_admin"):
+            g["user_role"] = "super_admin"
+        else:
+            membership = await db.group_members.find_one(
+                {"group_id": g["group_id"], "user_id": user["user_id"]}, {"_id": 0}
+            )
+            g["user_role"] = membership["role"] if membership else "none"
+    return groups
+
+
+@app.get("/api/groups/{group_id}")
+async def get_group(group_id: str, request: Request):
+    user = await get_current_user(request)
+    group = await db.groups.find_one({"group_id": group_id}, {"_id": 0})
+    if not group:
+        raise HTTPException(status_code=404, detail="Group not found")
+    if not user.get("is_super_admin"):
+        role = await get_group_member_role(user["user_id"], group_id)
+        if not role:
+            raise HTTPException(status_code=403, detail="Not a member of this group")
+        group["user_role"] = role
+    else:
+        group["user_role"] = "super_admin"
+    count = await db.group_members.count_documents({"group_id": group_id})
+    group["member_count"] = count
+    return group
+
+
+@app.put("/api/groups/{group_id}")
+async def update_group(group_id: str, body: GroupCreate, request: Request):
+    user, role = await require_group_role(request, group_id, ["admin"])
+    await db.groups.update_one(
+        {"group_id": group_id},
+        {"$set": {"name": body.name, "description": body.description,
+                  "updated_at": datetime.now(timezone.utc).isoformat()}}
+    )
+    updated = await db.groups.find_one({"group_id": group_id}, {"_id": 0})
+    return updated
+
+
+@app.delete("/api/groups/{group_id}")
+async def delete_group(group_id: str, request: Request):
+    user, role = await require_group_role(request, group_id, ["admin"])
+    await db.groups.delete_one({"group_id": group_id})
+    await db.group_members.delete_many({"group_id": group_id})
+    await db.funds.delete_many({"group_id": group_id})
+    await db.utilizations.delete_many({"group_id": group_id})
+    await db.invitations.delete_many({"group_id": group_id})
+    return {"message": "Group deleted"}
+
+
+# ── Group Members Endpoints ─────────────────────────────────────
+@app.get("/api/groups/{group_id}/members")
+async def list_group_members(group_id: str, request: Request):
+    user = await get_current_user(request)
+    if not user.get("is_super_admin"):
+        role = await get_group_member_role(user["user_id"], group_id)
+        if not role:
+            raise HTTPException(status_code=403, detail="Not a member")
+    members = await db.group_members.find({"group_id": group_id}, {"_id": 0}).to_list(500)
+    # Enrich with user info
+    for m in members:
+        u = await db.users.find_one({"user_id": m["user_id"]}, {"_id": 0})
+        if u:
+            m["name"] = u.get("name", "")
+            m["email"] = u.get("email", "")
+            m["avatar_url"] = u.get("avatar_url", "")
+            m["is_active"] = u.get("is_active", True)
+    return members
+
+
+@app.put("/api/groups/{group_id}/members/{member_user_id}/role")
+async def update_member_role(group_id: str, member_user_id: str, body: MemberRoleUpdate, request: Request):
+    user, role = await require_group_role(request, group_id, ["admin"])
+    if body.role not in ["admin", "contributor", "viewer"]:
+        raise HTTPException(status_code=400, detail="Invalid role")
+    existing = await db.group_members.find_one(
+        {"group_id": group_id, "user_id": member_user_id}, {"_id": 0}
+    )
+    if not existing:
+        raise HTTPException(status_code=404, detail="Member not found")
+    await db.group_members.update_one(
+        {"group_id": group_id, "user_id": member_user_id},
+        {"$set": {"role": body.role}}
+    )
+    return {"message": "Role updated"}
+
+
+@app.delete("/api/groups/{group_id}/members/{member_user_id}")
+async def remove_member(group_id: str, member_user_id: str, request: Request):
+    user, role = await require_group_role(request, group_id, ["admin"])
+    await db.group_members.delete_one({"group_id": group_id, "user_id": member_user_id})
+    return {"message": "Member removed"}
+
+
+# ── Invitation Endpoints ────────────────────────────────────────
+@app.post("/api/groups/{group_id}/invite")
+async def invite_member(group_id: str, body: InviteCreate, request: Request):
+    user, role = await require_group_role(request, group_id, ["admin"])
+    if body.role not in ["admin", "contributor", "viewer"]:
+        raise HTTPException(status_code=400, detail="Invalid role")
+    group = await db.groups.find_one({"group_id": group_id}, {"_id": 0})
+    if not group:
+        raise HTTPException(status_code=404, detail="Group not found")
+    # Check if already a member
+    existing_user = await db.users.find_one({"email": body.email}, {"_id": 0})
+    if existing_user:
+        existing_member = await db.group_members.find_one(
+            {"group_id": group_id, "user_id": existing_user["user_id"]}, {"_id": 0}
+        )
+        if existing_member:
+            raise HTTPException(status_code=400, detail="User is already a member of this group")
+    # Check existing pending invite
+    existing_invite = await db.invitations.find_one(
+        {"group_id": group_id, "email": body.email, "status": "pending"}, {"_id": 0}
+    )
+    if existing_invite:
+        raise HTTPException(status_code=400, detail="Invitation already sent to this email")
+
+    invite_id = f"inv_{uuid.uuid4().hex[:12]}"
+    await db.invitations.insert_one({
+        "invite_id": invite_id,
+        "group_id": group_id,
+        "email": body.email,
+        "role": body.role,
+        "invited_by_user_id": user["user_id"],
+        "invited_by_name": user["name"],
+        "status": "pending",
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    })
+
+    # Send invitation email via Resend
+    invite_link = f"{APP_URL}/invite/{invite_id}"
+    html_content = f"""
+    <div style="font-family: 'Segoe UI', Tahoma, sans-serif; max-width: 520px; margin: 0 auto; padding: 32px;">
+      <div style="background: #1D9E75; color: white; padding: 16px 24px; border-radius: 12px 12px 0 0; text-align: center;">
+        <h1 style="margin: 0; font-size: 22px;">FundTrack</h1>
+      </div>
+      <div style="background: #ffffff; border: 1px solid #E4E4E7; border-top: none; padding: 32px 24px; border-radius: 0 0 12px 12px;">
+        <p style="font-size: 16px; color: #374151; margin-top: 0;">Hi,</p>
+        <p style="font-size: 15px; color: #374151;"><strong>{user["name"]}</strong> has invited you to join <strong>{group["name"]}</strong> as a <strong style="color: #1D9E75;">{body.role}</strong>.</p>
+        <div style="text-align: center; margin: 28px 0;">
+          <a href="{invite_link}" style="background: #1D9E75; color: white; padding: 12px 32px; border-radius: 8px; text-decoration: none; font-size: 15px; font-weight: 600;">Accept Invitation</a>
+        </div>
+        <p style="font-size: 13px; color: #6B7280;">If the button doesn't work, copy this link:<br/><a href="{invite_link}" style="color: #1D9E75;">{invite_link}</a></p>
+      </div>
+    </div>
+    """
+    try:
+        params = {
+            "from": SENDER_EMAIL,
+            "to": [body.email],
+            "subject": f"You're invited to join {group['name']} on FundTrack",
+            "html": html_content,
+        }
+        await asyncio.to_thread(resend.Emails.send, params)
+        logger.info(f"Invitation email sent to {body.email}")
+    except Exception as e:
+        logger.error(f"Failed to send email: {e}")
+        # Don't fail the invite creation even if email fails
+
+    return {"invite_id": invite_id, "message": f"Invitation sent to {body.email}"}
+
+
+@app.get("/api/invitations/{invite_id}")
+async def get_invitation(invite_id: str):
+    inv = await db.invitations.find_one({"invite_id": invite_id}, {"_id": 0})
+    if not inv:
+        raise HTTPException(status_code=404, detail="Invitation not found")
+    group = await db.groups.find_one({"group_id": inv["group_id"]}, {"_id": 0})
+    inv["group_name"] = group["name"] if group else "Unknown"
+    return inv
+
+
+@app.post("/api/invitations/{invite_id}/accept")
+async def accept_invitation(invite_id: str, request: Request):
+    user = await get_current_user(request)
+    inv = await db.invitations.find_one({"invite_id": invite_id}, {"_id": 0})
+    if not inv:
+        raise HTTPException(status_code=404, detail="Invitation not found")
+    if inv["status"] != "pending":
+        raise HTTPException(status_code=400, detail="Invitation already processed")
+    if inv["email"] != user["email"]:
+        raise HTTPException(status_code=403, detail="This invitation is for a different email")
+    # Add to group
+    existing = await db.group_members.find_one(
+        {"group_id": inv["group_id"], "user_id": user["user_id"]}, {"_id": 0}
+    )
+    if not existing:
+        await db.group_members.insert_one({
+            "group_id": inv["group_id"],
+            "user_id": user["user_id"],
+            "role": inv["role"],
+            "joined_at": datetime.now(timezone.utc).isoformat(),
+        })
+    await db.invitations.update_one(
+        {"invite_id": invite_id},
+        {"$set": {"status": "accepted", "accepted_by_user_id": user["user_id"]}}
+    )
+    return {"message": "Invitation accepted", "group_id": inv["group_id"]}
+
+
+@app.get("/api/groups/{group_id}/invitations")
+async def list_invitations(group_id: str, request: Request):
+    user, role = await require_group_role(request, group_id, ["admin"])
+    invites = await db.invitations.find(
+        {"group_id": group_id}, {"_id": 0}
+    ).sort("created_at", -1).to_list(200)
+    return invites
+
+
+# ── Fund Endpoints (Group-Scoped) ───────────────────────────────
+@app.get("/api/groups/{group_id}/funds")
 async def list_funds(
+    group_id: str, request: Request,
     category: Optional[str] = None,
     date_from: Optional[str] = None,
     date_to: Optional[str] = None,
     search: Optional[str] = None,
-    user=Depends(get_current_user)
 ):
-    query = {}
+    user = await get_current_user(request)
+    if not user.get("is_super_admin"):
+        role = await get_group_member_role(user["user_id"], group_id)
+        if not role:
+            raise HTTPException(status_code=403, detail="Not a member")
+    query = {"group_id": group_id}
     if category:
         query["category"] = category
     if date_from:
@@ -186,16 +490,17 @@ async def list_funds(
         query.setdefault("date_received", {})["$lte"] = date_to
     if search:
         query["source_name"] = {"$regex": search, "$options": "i"}
-    cursor = db.funds.find(query, {"_id": 0}).sort("created_at", -1)
-    funds = await cursor.to_list(length=500)
+    funds = await db.funds.find(query, {"_id": 0}).sort("created_at", -1).to_list(500)
     return funds
 
 
-@app.post("/api/funds")
-async def create_fund(fund: FundCreate, user=Depends(require_role("admin", "contributor"))):
+@app.post("/api/groups/{group_id}/funds")
+async def create_fund(group_id: str, fund: FundCreate, request: Request):
+    user, role = await require_group_role(request, group_id, ["admin", "contributor"])
     fund_id = f"fund_{uuid.uuid4().hex[:12]}"
     doc = {
         "fund_id": fund_id,
+        "group_id": group_id,
         "source_name": fund.source_name,
         "amount_inr": fund.amount_inr,
         "category": fund.category,
@@ -212,22 +517,20 @@ async def create_fund(fund: FundCreate, user=Depends(require_role("admin", "cont
     return created
 
 
-@app.put("/api/funds/{fund_id}")
-async def update_fund(fund_id: str, fund: FundCreate, user=Depends(require_role("admin", "contributor"))):
-    existing = await db.funds.find_one({"fund_id": fund_id}, {"_id": 0})
+@app.put("/api/groups/{group_id}/funds/{fund_id}")
+async def update_fund(group_id: str, fund_id: str, fund: FundCreate, request: Request):
+    user, role = await require_group_role(request, group_id, ["admin", "contributor"])
+    existing = await db.funds.find_one({"fund_id": fund_id, "group_id": group_id}, {"_id": 0})
     if not existing:
         raise HTTPException(status_code=404, detail="Fund not found")
-    if user["role"] != "admin" and existing["added_by_user_id"] != user["user_id"]:
+    if role not in ["admin", "super_admin"] and existing["added_by_user_id"] != user["user_id"]:
         raise HTTPException(status_code=403, detail="Not authorized")
     await db.funds.update_one(
         {"fund_id": fund_id},
         {"$set": {
-            "source_name": fund.source_name,
-            "amount_inr": fund.amount_inr,
-            "category": fund.category,
-            "date_received": fund.date_received,
-            "notes": fund.notes,
-            "attachment_url": fund.attachment_url,
+            "source_name": fund.source_name, "amount_inr": fund.amount_inr,
+            "category": fund.category, "date_received": fund.date_received,
+            "notes": fund.notes, "attachment_url": fund.attachment_url,
             "updated_at": datetime.now(timezone.utc).isoformat(),
         }}
     )
@@ -235,27 +538,33 @@ async def update_fund(fund_id: str, fund: FundCreate, user=Depends(require_role(
     return updated
 
 
-@app.delete("/api/funds/{fund_id}")
-async def delete_fund(fund_id: str, user=Depends(require_role("admin", "contributor"))):
-    existing = await db.funds.find_one({"fund_id": fund_id}, {"_id": 0})
+@app.delete("/api/groups/{group_id}/funds/{fund_id}")
+async def delete_fund(group_id: str, fund_id: str, request: Request):
+    user, role = await require_group_role(request, group_id, ["admin", "contributor"])
+    existing = await db.funds.find_one({"fund_id": fund_id, "group_id": group_id}, {"_id": 0})
     if not existing:
         raise HTTPException(status_code=404, detail="Fund not found")
-    if user["role"] != "admin" and existing["added_by_user_id"] != user["user_id"]:
+    if role not in ["admin", "super_admin"] and existing["added_by_user_id"] != user["user_id"]:
         raise HTTPException(status_code=403, detail="Not authorized")
     await db.funds.delete_one({"fund_id": fund_id})
     return {"message": "Fund deleted"}
 
 
-# ── Utilization Endpoints ───────────────────────────────────────
-@app.get("/api/utilizations")
+# ── Utilization Endpoints (Group-Scoped) ────────────────────────
+@app.get("/api/groups/{group_id}/utilizations")
 async def list_utilizations(
+    group_id: str, request: Request,
     linked_fund_id: Optional[str] = None,
     date_from: Optional[str] = None,
     date_to: Optional[str] = None,
     spent_by_user_id: Optional[str] = None,
-    user=Depends(get_current_user)
 ):
-    query = {}
+    user = await get_current_user(request)
+    if not user.get("is_super_admin"):
+        role = await get_group_member_role(user["user_id"], group_id)
+        if not role:
+            raise HTTPException(status_code=403, detail="Not a member")
+    query = {"group_id": group_id}
     if linked_fund_id:
         query["linked_fund_id"] = linked_fund_id
     if date_from:
@@ -264,19 +573,20 @@ async def list_utilizations(
         query.setdefault("date_spent", {})["$lte"] = date_to
     if spent_by_user_id:
         query["spent_by_user_id"] = spent_by_user_id
-    cursor = db.utilizations.find(query, {"_id": 0}).sort("created_at", -1)
-    items = await cursor.to_list(length=500)
+    items = await db.utilizations.find(query, {"_id": 0}).sort("created_at", -1).to_list(500)
     return items
 
 
-@app.post("/api/utilizations")
-async def create_utilization(util: UtilizationCreate, user=Depends(require_role("admin", "contributor"))):
-    fund = await db.funds.find_one({"fund_id": util.linked_fund_id}, {"_id": 0})
+@app.post("/api/groups/{group_id}/utilizations")
+async def create_utilization(group_id: str, util: UtilizationCreate, request: Request):
+    user, role = await require_group_role(request, group_id, ["admin", "contributor"])
+    fund = await db.funds.find_one({"fund_id": util.linked_fund_id, "group_id": group_id}, {"_id": 0})
     if not fund:
-        raise HTTPException(status_code=400, detail="Linked fund not found")
+        raise HTTPException(status_code=400, detail="Linked fund not found in this group")
     util_id = f"util_{uuid.uuid4().hex[:12]}"
     doc = {
         "util_id": util_id,
+        "group_id": group_id,
         "purpose": util.purpose,
         "amount_inr": util.amount_inr,
         "date_spent": util.date_spent,
@@ -294,26 +604,24 @@ async def create_utilization(util: UtilizationCreate, user=Depends(require_role(
     return created
 
 
-@app.put("/api/utilizations/{util_id}")
-async def update_utilization(util_id: str, util: UtilizationCreate, user=Depends(require_role("admin", "contributor"))):
-    existing = await db.utilizations.find_one({"util_id": util_id}, {"_id": 0})
+@app.put("/api/groups/{group_id}/utilizations/{util_id}")
+async def update_utilization(group_id: str, util_id: str, util: UtilizationCreate, request: Request):
+    user, role = await require_group_role(request, group_id, ["admin", "contributor"])
+    existing = await db.utilizations.find_one({"util_id": util_id, "group_id": group_id}, {"_id": 0})
     if not existing:
         raise HTTPException(status_code=404, detail="Utilization not found")
-    if user["role"] != "admin" and existing["spent_by_user_id"] != user["user_id"]:
+    if role not in ["admin", "super_admin"] and existing["spent_by_user_id"] != user["user_id"]:
         raise HTTPException(status_code=403, detail="Not authorized")
-    fund = await db.funds.find_one({"fund_id": util.linked_fund_id}, {"_id": 0})
+    fund = await db.funds.find_one({"fund_id": util.linked_fund_id, "group_id": group_id}, {"_id": 0})
     if not fund:
         raise HTTPException(status_code=400, detail="Linked fund not found")
     await db.utilizations.update_one(
         {"util_id": util_id},
         {"$set": {
-            "purpose": util.purpose,
-            "amount_inr": util.amount_inr,
-            "date_spent": util.date_spent,
-            "linked_fund_id": util.linked_fund_id,
+            "purpose": util.purpose, "amount_inr": util.amount_inr,
+            "date_spent": util.date_spent, "linked_fund_id": util.linked_fund_id,
             "linked_fund_name": fund["source_name"],
-            "notes": util.notes,
-            "receipt_url": util.receipt_url,
+            "notes": util.notes, "receipt_url": util.receipt_url,
             "updated_at": datetime.now(timezone.utc).isoformat(),
         }}
     )
@@ -321,43 +629,39 @@ async def update_utilization(util_id: str, util: UtilizationCreate, user=Depends
     return updated
 
 
-@app.delete("/api/utilizations/{util_id}")
-async def delete_utilization(util_id: str, user=Depends(require_role("admin", "contributor"))):
-    existing = await db.utilizations.find_one({"util_id": util_id}, {"_id": 0})
+@app.delete("/api/groups/{group_id}/utilizations/{util_id}")
+async def delete_utilization(group_id: str, util_id: str, request: Request):
+    user, role = await require_group_role(request, group_id, ["admin", "contributor"])
+    existing = await db.utilizations.find_one({"util_id": util_id, "group_id": group_id}, {"_id": 0})
     if not existing:
         raise HTTPException(status_code=404, detail="Utilization not found")
-    if user["role"] != "admin" and existing["spent_by_user_id"] != user["user_id"]:
+    if role not in ["admin", "super_admin"] and existing["spent_by_user_id"] != user["user_id"]:
         raise HTTPException(status_code=403, detail="Not authorized")
     await db.utilizations.delete_one({"util_id": util_id})
     return {"message": "Utilization deleted"}
 
 
-# ── Dashboard Endpoint ──────────────────────────────────────────
-@app.get("/api/dashboard")
-async def get_dashboard(user=Depends(get_current_user)):
-    pipeline_total_funds = [{"$group": {"_id": None, "total": {"$sum": "$amount_inr"}}}]
-    pipeline_total_utils = [{"$group": {"_id": None, "total": {"$sum": "$amount_inr"}}}]
-    pipeline_by_category = [{"$group": {"_id": "$category", "total": {"$sum": "$amount_inr"}}}]
-    pipeline_monthly_funds = [
-        {"$group": {"_id": {"$substr": ["$date_received", 0, 7]}, "total": {"$sum": "$amount_inr"}}},
-        {"$sort": {"_id": 1}}
-    ]
-    pipeline_monthly_utils = [
-        {"$group": {"_id": {"$substr": ["$date_spent", 0, 7]}, "total": {"$sum": "$amount_inr"}}},
-        {"$sort": {"_id": 1}}
-    ]
+# ── Dashboard Endpoint (Group-Scoped) ───────────────────────────
+@app.get("/api/groups/{group_id}/dashboard")
+async def get_dashboard(group_id: str, request: Request):
+    user = await get_current_user(request)
+    if not user.get("is_super_admin"):
+        role = await get_group_member_role(user["user_id"], group_id)
+        if not role:
+            raise HTTPException(status_code=403, detail="Not a member")
+    match_f = {"$match": {"group_id": group_id}}
+    match_u = {"$match": {"group_id": group_id}}
 
-    total_funds_res = await db.funds.aggregate(pipeline_total_funds).to_list(1)
-    total_utils_res = await db.utilizations.aggregate(pipeline_total_utils).to_list(1)
-    by_category_res = await db.funds.aggregate(pipeline_by_category).to_list(100)
-    monthly_funds_res = await db.funds.aggregate(pipeline_monthly_funds).to_list(24)
-    monthly_utils_res = await db.utilizations.aggregate(pipeline_monthly_utils).to_list(24)
+    total_funds_res = await db.funds.aggregate([match_f, {"$group": {"_id": None, "total": {"$sum": "$amount_inr"}}}]).to_list(1)
+    total_utils_res = await db.utilizations.aggregate([match_u, {"$group": {"_id": None, "total": {"$sum": "$amount_inr"}}}]).to_list(1)
+    by_category_res = await db.funds.aggregate([match_f, {"$group": {"_id": "$category", "total": {"$sum": "$amount_inr"}}}]).to_list(100)
+    monthly_funds_res = await db.funds.aggregate([match_f, {"$group": {"_id": {"$substr": ["$date_received", 0, 7]}, "total": {"$sum": "$amount_inr"}}}, {"$sort": {"_id": 1}}]).to_list(24)
+    monthly_utils_res = await db.utilizations.aggregate([match_u, {"$group": {"_id": {"$substr": ["$date_spent", 0, 7]}, "total": {"$sum": "$amount_inr"}}}, {"$sort": {"_id": 1}}]).to_list(24)
 
     total_collected = total_funds_res[0]["total"] if total_funds_res else 0
     total_utilized = total_utils_res[0]["total"] if total_utils_res else 0
     balance = total_collected - total_utilized
     pct_utilized = round((total_utilized / total_collected * 100), 1) if total_collected > 0 else 0
-
     category_breakdown = [{"category": c["_id"], "amount": c["total"]} for c in by_category_res]
 
     months_set = set()
@@ -374,8 +678,8 @@ async def get_dashboard(user=Depends(get_current_user)):
         for m in months_set
     ], key=lambda x: x["month"])
 
-    recent_funds = await db.funds.find({}, {"_id": 0}).sort("created_at", -1).to_list(5)
-    recent_utils = await db.utilizations.find({}, {"_id": 0}).sort("created_at", -1).to_list(5)
+    recent_funds = await db.funds.find({"group_id": group_id}, {"_id": 0}).sort("created_at", -1).to_list(5)
+    recent_utils = await db.utilizations.find({"group_id": group_id}, {"_id": 0}).sort("created_at", -1).to_list(5)
     recent_activity = []
     for f in recent_funds:
         recent_activity.append({"type": "fund", "description": f"Fund added: {f['source_name']}", "amount": f["amount_inr"], "date": f["created_at"], "user": f.get("added_by_name", "")})
@@ -385,57 +689,27 @@ async def get_dashboard(user=Depends(get_current_user)):
     recent_activity = recent_activity[:10]
 
     return {
-        "total_collected": total_collected,
-        "total_utilized": total_utilized,
-        "balance": balance,
-        "pct_utilized": pct_utilized,
-        "category_breakdown": category_breakdown,
-        "monthly_data": monthly_data,
+        "total_collected": total_collected, "total_utilized": total_utilized,
+        "balance": balance, "pct_utilized": pct_utilized,
+        "category_breakdown": category_breakdown, "monthly_data": monthly_data,
         "recent_activity": recent_activity,
     }
 
 
-# ── User Management Endpoints ──────────────────────────────────
-@app.get("/api/users")
-async def list_users(user=Depends(require_role("admin"))):
-    cursor = db.users.find({}, {"_id": 0}).sort("created_at", -1)
-    users = await cursor.to_list(length=200)
-    return users
-
-
-@app.put("/api/users/{user_id}/role")
-async def update_user_role(user_id: str, body: RoleUpdate, user=Depends(require_role("admin"))):
-    if body.role not in ["admin", "contributor", "viewer"]:
-        raise HTTPException(status_code=400, detail="Invalid role")
-    existing = await db.users.find_one({"user_id": user_id}, {"_id": 0})
-    if not existing:
-        raise HTTPException(status_code=404, detail="User not found")
-    await db.users.update_one({"user_id": user_id}, {"$set": {"role": body.role}})
-    updated = await db.users.find_one({"user_id": user_id}, {"_id": 0})
-    return updated
-
-
-@app.put("/api/users/{user_id}/status")
-async def update_user_status(user_id: str, body: UserStatusUpdate, user=Depends(require_role("admin"))):
-    existing = await db.users.find_one({"user_id": user_id}, {"_id": 0})
-    if not existing:
-        raise HTTPException(status_code=404, detail="User not found")
-    await db.users.update_one({"user_id": user_id}, {"$set": {"is_active": body.is_active}})
-    updated = await db.users.find_one({"user_id": user_id}, {"_id": 0})
-    return updated
-
-
-# ── Export Endpoint ─────────────────────────────────────────────
-@app.get("/api/export/excel")
+# ── Export Endpoint (Group-Scoped) ──────────────────────────────
+@app.get("/api/groups/{group_id}/export/excel")
 async def export_excel(
-    date_from: Optional[str] = None,
-    date_to: Optional[str] = None,
-    category: Optional[str] = None,
-    user_id: Optional[str] = None,
-    user=Depends(get_current_user)
+    group_id: str, request: Request,
+    date_from: Optional[str] = None, date_to: Optional[str] = None,
+    category: Optional[str] = None, user_id: Optional[str] = None,
 ):
-    fund_query = {}
-    util_query = {}
+    user = await get_current_user(request)
+    if not user.get("is_super_admin"):
+        role = await get_group_member_role(user["user_id"], group_id)
+        if not role:
+            raise HTTPException(status_code=403, detail="Not a member")
+    fund_query = {"group_id": group_id}
+    util_query = {"group_id": group_id}
     if category:
         fund_query["category"] = category
     if date_from:
@@ -454,100 +728,71 @@ async def export_excel(
     wb = Workbook()
     header_font = Font(bold=True, color="000000")
     header_fill = PatternFill(start_color="B4D7E8", end_color="B4D7E8", fill_type="solid")
-    currency_format = '₹#,##0.00'
+    currency_fmt = '\u20b9#,##0.00'
 
     ws1 = wb.active
     ws1.title = "Funds"
-    fund_headers = ["#", "Source", "Amount (₹)", "Category", "Date Received", "Added By", "Notes"]
-    for col_idx, h in enumerate(fund_headers, 1):
-        cell = ws1.cell(row=1, column=col_idx, value=h)
-        cell.font = header_font
-        cell.fill = header_fill
-        cell.alignment = Alignment(horizontal="center")
-    total_fund_amount = 0
+    for col_idx, h in enumerate(["#", "Source", "Amount", "Category", "Date Received", "Added By", "Notes"], 1):
+        c = ws1.cell(row=1, column=col_idx, value=h)
+        c.font = header_font; c.fill = header_fill; c.alignment = Alignment(horizontal="center")
+    total_f = 0
     for i, f in enumerate(funds, 1):
         ws1.cell(row=i+1, column=1, value=i)
         ws1.cell(row=i+1, column=2, value=f.get("source_name", ""))
-        amt_cell = ws1.cell(row=i+1, column=3, value=f.get("amount_inr", 0))
-        amt_cell.number_format = currency_format
-        total_fund_amount += f.get("amount_inr", 0)
+        ac = ws1.cell(row=i+1, column=3, value=f.get("amount_inr", 0)); ac.number_format = currency_fmt
+        total_f += f.get("amount_inr", 0)
         ws1.cell(row=i+1, column=4, value=f.get("category", ""))
         ws1.cell(row=i+1, column=5, value=f.get("date_received", ""))
         ws1.cell(row=i+1, column=6, value=f.get("added_by_name", ""))
         ws1.cell(row=i+1, column=7, value=f.get("notes", ""))
-    summary_row = len(funds) + 2
-    ws1.cell(row=summary_row, column=2, value="TOTAL").font = Font(bold=True)
-    total_cell = ws1.cell(row=summary_row, column=3, value=total_fund_amount)
-    total_cell.font = Font(bold=True)
-    total_cell.number_format = currency_format
+    sr = len(funds) + 2
+    ws1.cell(row=sr, column=2, value="TOTAL").font = Font(bold=True)
+    tc = ws1.cell(row=sr, column=3, value=total_f); tc.font = Font(bold=True); tc.number_format = currency_fmt
     for col in ws1.columns:
-        max_len = max(len(str(cell.value or "")) for cell in col)
-        ws1.column_dimensions[col[0].column_letter].width = min(max_len + 4, 40)
+        ws1.column_dimensions[col[0].column_letter].width = min(max(len(str(c.value or "")) for c in col) + 4, 40)
 
     ws2 = wb.create_sheet("Utilization")
-    util_headers = ["#", "Purpose", "Amount (₹)", "Date Spent", "Linked Fund", "Spent By", "Notes"]
-    for col_idx, h in enumerate(util_headers, 1):
-        cell = ws2.cell(row=1, column=col_idx, value=h)
-        cell.font = header_font
-        cell.fill = header_fill
-        cell.alignment = Alignment(horizontal="center")
-    total_util_amount = 0
+    for col_idx, h in enumerate(["#", "Purpose", "Amount", "Date Spent", "Linked Fund", "Spent By", "Notes"], 1):
+        c = ws2.cell(row=1, column=col_idx, value=h)
+        c.font = header_font; c.fill = header_fill; c.alignment = Alignment(horizontal="center")
+    total_u = 0
     for i, u in enumerate(utils, 1):
         ws2.cell(row=i+1, column=1, value=i)
         ws2.cell(row=i+1, column=2, value=u.get("purpose", ""))
-        amt_cell = ws2.cell(row=i+1, column=3, value=u.get("amount_inr", 0))
-        amt_cell.number_format = currency_format
-        total_util_amount += u.get("amount_inr", 0)
+        ac = ws2.cell(row=i+1, column=3, value=u.get("amount_inr", 0)); ac.number_format = currency_fmt
+        total_u += u.get("amount_inr", 0)
         ws2.cell(row=i+1, column=4, value=u.get("date_spent", ""))
         ws2.cell(row=i+1, column=5, value=u.get("linked_fund_name", ""))
         ws2.cell(row=i+1, column=6, value=u.get("spent_by_name", ""))
         ws2.cell(row=i+1, column=7, value=u.get("notes", ""))
-    summary_row2 = len(utils) + 2
-    ws2.cell(row=summary_row2, column=2, value="TOTAL").font = Font(bold=True)
-    total_cell2 = ws2.cell(row=summary_row2, column=3, value=total_util_amount)
-    total_cell2.font = Font(bold=True)
-    total_cell2.number_format = currency_format
+    sr2 = len(utils) + 2
+    ws2.cell(row=sr2, column=2, value="TOTAL").font = Font(bold=True)
+    tc2 = ws2.cell(row=sr2, column=3, value=total_u); tc2.font = Font(bold=True); tc2.number_format = currency_fmt
     for col in ws2.columns:
-        max_len = max(len(str(cell.value or "")) for cell in col)
-        ws2.column_dimensions[col[0].column_letter].width = min(max_len + 4, 40)
+        ws2.column_dimensions[col[0].column_letter].width = min(max(len(str(c.value or "")) for c in col) + 4, 40)
 
     ws3 = wb.create_sheet("Summary")
-    summary_headers = ["Metric", "Value"]
-    for col_idx, h in enumerate(summary_headers, 1):
-        cell = ws3.cell(row=1, column=col_idx, value=h)
-        cell.font = header_font
-        cell.fill = header_fill
-    balance = total_fund_amount - total_util_amount
-    pct = round((total_util_amount / total_fund_amount * 100), 1) if total_fund_amount > 0 else 0
-    summary_data = [
-        ("Total Collected", total_fund_amount),
-        ("Total Utilized", total_util_amount),
-        ("Balance", balance),
-        ("% Utilized", f"{pct}%"),
-    ]
-    cat_pipeline = [{"$match": fund_query}, {"$group": {"_id": "$category", "total": {"$sum": "$amount_inr"}}}]
-    cat_breakdown = await db.funds.aggregate(cat_pipeline).to_list(100)
-    for c in cat_breakdown:
-        summary_data.append((f"Category: {c['_id']}", c['total']))
-    for i, (metric, value) in enumerate(summary_data, 2):
-        ws3.cell(row=i, column=1, value=metric)
-        cell = ws3.cell(row=i, column=2, value=value)
-        if isinstance(value, (int, float)):
-            cell.number_format = currency_format
+    for col_idx, h in enumerate(["Metric", "Value"], 1):
+        c = ws3.cell(row=1, column=col_idx, value=h); c.font = header_font; c.fill = header_fill
+    bal = total_f - total_u
+    pct = round((total_u / total_f * 100), 1) if total_f > 0 else 0
+    rows = [("Total Collected", total_f), ("Total Utilized", total_u), ("Balance", bal), ("% Utilized", f"{pct}%")]
+    cat_p = [{"$match": fund_query}, {"$group": {"_id": "$category", "total": {"$sum": "$amount_inr"}}}]
+    for c in await db.funds.aggregate(cat_p).to_list(100):
+        rows.append((f"Category: {c['_id']}", c['total']))
+    for i, (m, v) in enumerate(rows, 2):
+        ws3.cell(row=i, column=1, value=m)
+        cl = ws3.cell(row=i, column=2, value=v)
+        if isinstance(v, (int, float)): cl.number_format = currency_fmt
     for col in ws3.columns:
-        max_len = max(len(str(cell.value or "")) for cell in col)
-        ws3.column_dimensions[col[0].column_letter].width = min(max_len + 4, 40)
+        ws3.column_dimensions[col[0].column_letter].width = min(max(len(str(c.value or "")) for c in col) + 4, 40)
 
-    buf = BytesIO()
-    wb.save(buf)
-    buf.seek(0)
-    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    filename = f"fundtrack_report_{today}.xlsx"
-    return StreamingResponse(
-        buf,
-        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        headers={"Content-Disposition": f"attachment; filename={filename}"}
-    )
+    buf = BytesIO(); wb.save(buf); buf.seek(0)
+    group = await db.groups.find_one({"group_id": group_id}, {"_id": 0})
+    gname = (group["name"] if group else "report").replace(" ", "_")
+    filename = f"fundtrack_{gname}_{datetime.now(timezone.utc).strftime('%Y-%m-%d')}.xlsx"
+    return StreamingResponse(buf, media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                             headers={"Content-Disposition": f"attachment; filename={filename}"})
 
 
 # ── Health Check ────────────────────────────────────────────────

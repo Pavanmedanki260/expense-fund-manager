@@ -6,7 +6,7 @@ export default function Login() {
 
   const handleGoogleLogin = () => {
     // REMINDER: DO NOT HARDCODE THE URL, OR ADD ANY FALLBACKS OR REDIRECT URLS, THIS BREAKS THE AUTH
-    const redirectUrl = window.location.origin + '/dashboard';
+    const redirectUrl = window.location.origin + '/groups';
     window.location.href = `https://auth.emergentagent.com/?redirect=${encodeURIComponent(redirectUrl)}`;
   };
 
@@ -19,11 +19,11 @@ export default function Login() {
             <h1>FundTrack</h1>
           </div>
           <p className="login-tagline">
-            Track fund collections and utilizations with real-time analytics. 
+            Track fund collections and utilizations across multiple groups with real-time analytics.
             Manage your organization's finances with clarity and control.
           </p>
-          <button 
-            className="google-btn" 
+          <button
+            className="google-btn"
             onClick={handleGoogleLogin}
             data-testid="google-login-btn"
           >
@@ -38,9 +38,9 @@ export default function Login() {
         </div>
       </div>
       <div className="login-right">
-        <img 
-          src="https://images.pexels.com/photos/36077712/pexels-photo-36077712.jpeg?auto=compress&cs=tinysrgb&dpr=2&h=650&w=940" 
-          alt="Modern architecture" 
+        <img
+          src="https://images.pexels.com/photos/36077712/pexels-photo-36077712.jpeg?auto=compress&cs=tinysrgb&dpr=2&h=650&w=940"
+          alt="Modern architecture"
         />
         <div className="login-right-overlay"></div>
       </div>
