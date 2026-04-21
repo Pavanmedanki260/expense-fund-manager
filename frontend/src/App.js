@@ -1,9 +1,8 @@
 import React from 'react';
-import { BrowserRouter, Routes, Route, useLocation, Navigate } from 'react-router-dom';
+import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom';
 import { Toaster } from 'react-hot-toast';
 import { ThemeProvider } from './contexts/ThemeContext';
 import { AuthProvider, useAuth } from './contexts/AuthContext';
-import AuthCallback from './pages/AuthCallback';
 import Login from './pages/Login';
 import GroupList from './pages/GroupList';
 import GroupDashboard from './pages/GroupDashboard';
@@ -16,24 +15,12 @@ import GroupLayout from './components/GroupLayout';
 
 function ProtectedRoute({ children }) {
   const { user, loading } = useAuth();
-  if (loading) {
-    return (
-      <div className="loading-page">
-        <div className="spinner"></div>
-        <p>Loading...</p>
-      </div>
-    );
-  }
+  if (loading) return <div className="loading-page"><div className="spinner"></div><p>Loading...</p></div>;
   if (!user) return <Navigate to="/login" replace />;
   return children;
 }
 
 function AppRouter() {
-  const location = useLocation();
-  // REMINDER: DO NOT HARDCODE THE URL, OR ADD ANY FALLBACKS OR REDIRECT URLS, THIS BREAKS THE AUTH
-  if (location.hash?.includes('session_id=')) {
-    return <AuthCallback />;
-  }
   return (
     <Routes>
       <Route path="/login" element={<Login />} />
@@ -55,13 +42,7 @@ export default function App() {
       <BrowserRouter>
         <AuthProvider>
           <AppRouter />
-          <Toaster
-            position="top-right"
-            toastOptions={{
-              duration: 3000,
-              style: { background: 'var(--surface)', color: 'var(--text-body)', border: '1px solid var(--border)', borderRadius: '8px', fontSize: '14px' }
-            }}
-          />
+          <Toaster position="top-right" toastOptions={{ duration: 3000, style: { background: 'var(--surface)', color: 'var(--text-body)', border: '1px solid var(--border)', borderRadius: '8px', fontSize: '14px' } }} />
         </AuthProvider>
       </BrowserRouter>
     </ThemeProvider>

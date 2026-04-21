@@ -10,9 +10,16 @@ export function AuthProvider({ children }) {
   const checkAuth = useCallback(async () => {
     try {
       const res = await fetch(`${API}/api/auth/me`, { credentials: 'include' });
-      if (!res.ok) throw new Error('Not authenticated');
-      const data = await res.json();
-      setUser(data);
+      if (!res.ok) {
+        // Try refresh
+        const refreshRes = await fetch(`${API}/api/auth/refresh`, { method: 'POST', credentials: 'include' });
+        if (refreshRes.ok) {
+          const retryRes = await fetch(`${API}/api/auth/me`, { credentials: 'include' });
+          if (retryRes.ok) { setUser(await retryRes.json()); setLoading(false); return; }
+        }
+        throw new Error('Not authenticated');
+      }
+      setUser(await res.json());
     } catch {
       setUser(null);
     } finally {
@@ -20,19 +27,10 @@ export function AuthProvider({ children }) {
     }
   }, []);
 
-  useEffect(() => {
-    // CRITICAL: If returning from OAuth callback, skip the /me check.
-    if (window.location.hash?.includes('session_id=')) {
-      setLoading(false);
-      return;
-    }
-    checkAuth();
-  }, [checkAuth]);
+  useEffect(() => { checkAuth(); }, [checkAuth]);
 
   const logout = async () => {
-    try {
-      await fetch(`${API}/api/auth/logout`, { method: 'POST', credentials: 'include' });
-    } catch { /* ignore */ }
+    try { await fetch(`${API}/api/auth/logout`, { method: 'POST', credentials: 'include' }); } catch {}
     setUser(null);
   };
 
