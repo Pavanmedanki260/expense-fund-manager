@@ -14,7 +14,6 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from fastapi import FastAPI, HTTPException, Request, Response, Depends
-from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from motor.motor_asyncio import AsyncIOMotorClient
@@ -37,13 +36,27 @@ ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "Admin@123")
 
 resend.api_key = RESEND_API_KEY
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origin_regex=r"https://.*\.emergentagent\.com|http://localhost:\d+",
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.responses import Response as StarletteResponse
+
+class DynamicCORSMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request, call_next):
+        origin = request.headers.get("origin", "")
+        if request.method == "OPTIONS":
+            resp = StarletteResponse(status_code=204)
+            resp.headers["Access-Control-Allow-Origin"] = origin or "*"
+            resp.headers["Access-Control-Allow-Credentials"] = "true"
+            resp.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, DELETE, OPTIONS, PATCH"
+            resp.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization, X-Requested-With"
+            resp.headers["Access-Control-Max-Age"] = "86400"
+            return resp
+        response = await call_next(request)
+        if origin:
+            response.headers["Access-Control-Allow-Origin"] = origin
+            response.headers["Access-Control-Allow-Credentials"] = "true"
+        return response
+
+app.add_middleware(DynamicCORSMiddleware)
 
 client = AsyncIOMotorClient(MONGO_URL)
 db = client[DB_NAME]
@@ -213,7 +226,9 @@ async def register(body: RegisterBody, response: Response):
     refresh = create_refresh_token(user_id)
     set_auth_cookies(response, access, refresh)
     user = await db.users.find_one({"user_id": user_id}, {"_id": 0})
-    return user_response(user)
+    result = user_response(user)
+    result["access_token"] = access
+    return result
 
 
 @app.post("/api/auth/login")
@@ -254,7 +269,9 @@ async def login(body: LoginBody, request: Request, response: Response):
     access = create_access_token(user["user_id"], email)
     refresh = create_refresh_token(user["user_id"])
     set_auth_cookies(response, access, refresh)
-    return user_response(user)
+    result = user_response(user)
+    result["access_token"] = access
+    return result
 
 
 @app.get("/api/auth/me")

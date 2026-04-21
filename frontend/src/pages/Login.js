@@ -4,8 +4,9 @@ import { useAuth } from '../contexts/AuthContext';
 import { useTheme } from '../contexts/ThemeContext';
 import toast from 'react-hot-toast';
 import { Eye, EyeOff } from 'lucide-react';
+import { setToken } from '../utils';
 
-const API = process.env.REACT_APP_BACKEND_URL;
+const API = process.env.REACT_APP_BACKEND_URL || '';
 
 export default function Login() {
   const { theme } = useTheme();
@@ -30,7 +31,6 @@ export default function Login() {
       const res = await fetch(`${API}${endpoint}`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        credentials: 'include',
         body: JSON.stringify(body),
       });
       const data = await res.json();
@@ -41,7 +41,8 @@ export default function Login() {
         else setError('Something went wrong');
         return;
       }
-      setUser(data);
+      if (data.access_token) setToken(data.access_token);
+      setUser(data.user || data);
       toast.success(isRegister ? 'Account created!' : 'Welcome back!');
       navigate('/groups', { replace: true });
     } catch (err) {

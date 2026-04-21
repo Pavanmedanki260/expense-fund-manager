@@ -1,6 +1,7 @@
 import React, { createContext, useContext, useState, useEffect, useCallback } from 'react';
+import { setToken, getToken } from '../utils';
 
-const API = process.env.REACT_APP_BACKEND_URL;
+const API = process.env.REACT_APP_BACKEND_URL || '';
 const AuthContext = createContext();
 
 export function AuthProvider({ children }) {
@@ -8,17 +9,11 @@ export function AuthProvider({ children }) {
   const [loading, setLoading] = useState(true);
 
   const checkAuth = useCallback(async () => {
+    const token = getToken();
+    if (!token) { setUser(null); setLoading(false); return; }
     try {
-      const res = await fetch(`${API}/api/auth/me`, { credentials: 'include' });
-      if (!res.ok) {
-        // Try refresh
-        const refreshRes = await fetch(`${API}/api/auth/refresh`, { method: 'POST', credentials: 'include' });
-        if (refreshRes.ok) {
-          const retryRes = await fetch(`${API}/api/auth/me`, { credentials: 'include' });
-          if (retryRes.ok) { setUser(await retryRes.json()); setLoading(false); return; }
-        }
-        throw new Error('Not authenticated');
-      }
+      const res = await fetch(`${API}/api/auth/me`, { headers: { 'Authorization': `Bearer ${token}` } });
+      if (!res.ok) { setToken(null); throw new Error('Not authenticated'); }
       setUser(await res.json());
     } catch {
       setUser(null);
@@ -30,7 +25,9 @@ export function AuthProvider({ children }) {
   useEffect(() => { checkAuth(); }, [checkAuth]);
 
   const logout = async () => {
-    try { await fetch(`${API}/api/auth/logout`, { method: 'POST', credentials: 'include' }); } catch {}
+    const token = getToken();
+    try { await fetch(`${API}/api/auth/logout`, { method: 'POST', headers: { 'Authorization': `Bearer ${token}` } }); } catch {}
+    setToken(null);
     setUser(null);
   };
 
