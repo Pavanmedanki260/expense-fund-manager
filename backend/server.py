@@ -39,11 +39,7 @@ resend.api_key = RESEND_API_KEY
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        APP_URL,
-        "http://localhost:3000",
-        "https://b844d7d4-15d5-4ca4-8fbd-5ff90237ce2f.preview.emergentagent.com",
-    ],
+    allow_origin_regex=r"https://.*\.emergentagent\.com|http://localhost:\d+",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
